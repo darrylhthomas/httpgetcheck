@@ -1,0 +1,318 @@
+#!/usr/bin/perl -w
+
+# httpgetcheck - A simple perl script for monitoring a URL for changes and calling a phone number via Twilio when a change is detected.
+# 
+# Written by Darryl H. Thomas
+# No rights reserved. The contents of this file are Public Domain and may be used freely.
+
+use strict 'vars';
+use Getopt::Long;
+use Pod::Usage;
+use File::Path qw(make_path);
+use URI::Escape;
+
+our $CURL_COMMAND = 'curl';
+
+our $DATA_DIR = '/var/httpgetcheck/';
+
+# Replace these with your Twilio api credentials, or pass values in as options
+our $TW_ACCOUNT_SID = '';
+our $TW_AUTH_TOKEN = '';
+
+# Sender phone number in RFC 3966 format (+ddddddddddd)
+our $TW_PHONE_NUMBER = '';
+
+our $TWIMLETS_ECHO_URL_FORMAT = 'http://twimlets.com/echo?Twiml=%s';
+
+our $CONTENT_CHANGED_MESSAGE = "The URL I've been asked to monitor has changed.";
+our $HEARTBEAT_MESSAGE = "I just wanted to let you know I'm still alive. Sorry if I woke you up.";
+our $HEARTBEAT_INTERVAL = 60 * 60 * 24 * 7; # 7 "days"
+our $HEARTBEAT_SQUELCH_START_HOUR = -1;
+our $HEARTBEAT_SQUELCH_END_HOUR = -1;
+
+# Recipient phone number in RFC 3966 format (+ddddddddddd)
+our @ALERT_RECIPIENT_PHONE_NUMBERS = ();
+
+my $CHECK_URL = '';
+
+my $man = 0;
+my $help = 0;
+
+GetOptions(
+	'help|?' => \$help,
+	man => \$man,
+	'data-dir=s' => \$DATA_DIR,
+	'twilio-account-sid=s' => \$TW_ACCOUNT_SID,
+	'twilio-auth-token=s' => \$TW_AUTH_TOKEN,
+	'twilio-phone-number=s' => \$TW_PHONE_NUMBER,
+	'heartbeat-interval=i' => \$HEARTBEAT_INTERVAL,
+	'heartbeat-squelch-start-hour=i' => \$HEARTBEAT_SQUELCH_START_HOUR,
+	'heartbeat-squelch-end-hour=i' => \$HEARTBEAT_SQUELCH_END_HOUR,
+	'check-url=s' => \$CHECK_URL,
+	'content-changed-message=s' => \$CONTENT_CHANGED_MESSAGE,
+	'heartbeat-message=s' => \$HEARTBEAT_MESSAGE,
+	'recipient=s' => \@ALERT_RECIPIENT_PHONE_NUMBERS,
+) or pod2usage(1);
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+if (!length($CHECK_URL)) {
+	print STDERR "No URL specified.\n";
+	pod2usage(1);
+}
+
+our $TW_CALLS_API_ENDPOINT = sprintf('https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json', $TW_ACCOUNT_SID);
+
+create_data_dir_if_needed();
+my $cached_version_path = $DATA_DIR . '/cached_version';
+my $latest_version_path = $DATA_DIR . '/latest_version';
+my $state_file_path = $DATA_DIR . '/state';
+
+my %state = read_state_file($state_file_path);
+
+# If content from a prior run is available, move it to the cached version path.
+if (-e $latest_version_path and -r $latest_version_path) {
+	rename $latest_version_path, $cached_version_path
+}
+curl_get($CHECK_URL, $latest_version_path) == 0 || die("Failed to get \"$latest_version_path\".");
+
+if (-e $cached_version_path and -r $cached_version_path)
+{
+	my @DIFF = `diff $cached_version_path $latest_version_path`;
+	if (@DIFF) {
+		warn "Differences found.\n";
+		foreach (@DIFF) {
+			print;
+		}
+		my $message = $CONTENT_CHANGED_MESSAGE . "  The affected url is: " . $CHECK_URL;
+		foreach (@ALERT_RECIPIENT_PHONE_NUMBERS) {
+			call_phone($_, $message);
+		}
+	}
+}
+
+perform_heartbeat_if_needed(\%state);
+
+$state{"last_run"} = time;
+write_state_file($state_file_path, \%state);
+
+sub create_data_dir_if_needed
+{
+	if (-e $DATA_DIR) {
+		die("File at data directory path exists and is not a directory") unless -d $DATA_DIR;
+	} else {
+		warn "Creating data directory at path \"$DATA_DIR\".\n";
+		die("Could not create data directory") unless make_path($DATA_DIR);
+	}
+}
+
+sub read_state_file
+{
+	my $state_file_path = shift;
+	my %result = ();
+	if (-e $state_file_path and -r $state_file_path) {
+		open(my $file, "<", $state_file_path);
+	
+		foreach (<$file>) {
+			chomp;
+			(my $key, my $value) = split /=/;
+			$result{$key} = $value;
+		}
+	
+		close $file;
+	}
+	
+	return %result;
+}
+
+sub write_state_file
+{
+	my $state_file_path = shift;
+	my $state = shift;
+	
+	open(my $file, ">", $state_file_path);
+	foreach (keys %$state) {
+		my $key = $_;
+		my $value = $state->{$key};
+		print $file "$key=$value\n";
+	}
+	close $file;
+}
+
+sub write_content_file
+{
+	my $cached_file_path = shift;
+	my $cache_content = shift;
+	
+	open(my $file, ">", $cached_file_path);
+	print $file $cache_content;
+	close $file;
+}
+
+sub curl_get
+{
+	my $url = shift;
+	my $output_path = shift;
+	
+	my @CURL_ARGS = ($CURL_COMMAND,
+		'-s', '-S',
+		'-o', $output_path,
+		'-X', 'GET', $url
+	);
+	
+	return system @CURL_ARGS;
+}
+
+sub compose_say_response_twiml
+{
+	return sprintf('<Response><Say>%s</Say></Response>', shift);
+}
+
+sub twimlet_echo_url
+{
+	return sprintf($TWIMLETS_ECHO_URL_FORMAT, uri_escape(shift))
+}
+
+sub call_phone
+{
+	my $phone_number = shift;
+	my $message = shift;
+	my $twiml = compose_say_response_twiml($message);
+	my $twiml_url = twimlet_echo_url($twiml);
+	
+	my @CURL_ARGS = ($CURL_COMMAND,
+		'-X', 'POST', $TW_CALLS_API_ENDPOINT,
+		'-u', $TW_ACCOUNT_SID . ':' . $TW_AUTH_TOKEN,
+		'-d', 'From=' . $TW_PHONE_NUMBER,
+		'-d', 'To=' . $phone_number,
+		'-d', 'Url=' . uri_escape($twiml_url)
+	);
+	
+	system @CURL_ARGS;
+}
+
+sub get_local_hour
+{
+	my(undef,undef,$hour,undef,undef,undef,undef,undef,undef) = localtime(time);
+	
+	return $hour;
+}
+
+sub local_hour_is_in_squelch_period
+{
+	if (($HEARTBEAT_SQUELCH_START_HOUR == -1) || ($HEARTBEAT_SQUELCH_END_HOUR == -1)) {
+		return 0;
+	}
+	
+	my $local_hour = get_local_hour();
+	if ($HEARTBEAT_SQUELCH_START_HOUR > $HEARTBEAT_SQUELCH_END_HOUR) {
+		# Special case for spanning the date boundary
+		my $is_after_start = ($local_hour >= $HEARTBEAT_SQUELCH_START_HOUR) && ($local_hour <= 24);
+		my $is_before_end = ($local_hour >= 0) && ($local_hour < $HEARTBEAT_SQUELCH_END_HOUR);
+		return ($is_after_start) || ($is_before_end);
+	}
+	
+	return ($local_hour >= $HEARTBEAT_SQUELCH_START_HOUR) and ($local_hour < $HEARTBEAT_SQUELCH_END_HOUR);
+}
+
+sub perform_heartbeat_if_needed
+{
+	my $state_hash = shift;
+	my $last_run = $state_hash->{"last_run"} || 0;
+	my $last_heartbeat = $state_hash->{"last_heartbeat"} || 0;
+	my $current_time = time;
+
+	if ($last_run == 0) {
+		$state_hash->{"last_heartbeat"} = $current_time;
+		return;
+	}
+	
+	if ($HEARTBEAT_INTERVAL <= 0) {
+		return;
+	}
+	
+	if (local_hour_is_in_squelch_period()) {
+		return;
+	}
+
+	if (($current_time - $last_heartbeat) > $HEARTBEAT_INTERVAL) {
+		warn "Sending heartbeat message.\n";
+		foreach (@ALERT_RECIPIENT_PHONE_NUMBERS) {
+			call_phone($_, $HEARTBEAT_MESSAGE);
+		}
+		$state_hash->{"last_heartbeat"} = $current_time;
+	}
+}
+
+__END__
+
+=head1 NAME
+
+httpgetcheck - Compares the contents of the WWDC page between subsequent runs and sends alerts if the content has changed
+
+=head1 SYNOPSIS
+
+httpgetcheck [options]
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Prints a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=item B<-data-dir=DIR>
+
+Specifies the directory to which content and state is saved. The default value is "/var/httpgetcheck". If the directory does not exist, it will be created.
+
+=item B<-twilio-account-sid=SID>
+
+Specifies the account sid for the Twilio api account to use.
+
+=item B<-twilio-auth-token=TOKEN>
+
+Specifies the auth token for the Twilio api account to use.
+
+=item B<-twilio-phone-number=PHONE>
+
+Specifies the outgoing phone number in RFC 3966 format to use for Twilio calls.
+
+=item B<-heartbeat-interval=INTERVAL>
+
+Specifies the interval (in seconds) between heartbeat calls. The default is 7 * 24 * 60 * 60 or 7 "days". Setting the interval to 0 disables heartbeat calls.
+
+=item B<-heartbeat-squelch-start-hour=HOUR>
+
+Specifies the local hour of the day at which heartbeat calls should not be made. Setting the hour to -1, the default, disables squelching.
+
+=item B<-heartbeat-squelch-end-hour=HOUR>
+
+Specifies the local hour of the day at which heartbeat calls should resume. Setting the hour to -1, the default, disables squelching.
+
+=item B<-check-url=URL>
+
+The HTTP(S) URL to get for content checking.
+
+=item B<-content-changed-message=MESSAGE>
+
+The text to say when announcing content changes. The checked URL will be appended to the message.
+
+=item B<-heartbeat-message=MESSAGE>
+
+Specifies the text to say during a heartbeat call.
+
+=item B<-recipient=PHONE>
+
+Specifies a phone number in RFC 3966 format to call for alerts. Multiple recipents can be spcified using a -recipient option for each phone number.
+
+=back
+
+=head1 DESCRIPTION
+
+B<httpgetcheck> Requests a URL and compares the response content against the previous run. If the content has changed, a Twilio call is made to each specified recipient phone number. httpgetcheck also makes a heartbeat call at the specified interval so that recipients can be assured checks are being performed even if content has not changed.
+
+=cut
